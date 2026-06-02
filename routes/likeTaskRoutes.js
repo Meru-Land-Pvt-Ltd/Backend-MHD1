@@ -36,4 +36,24 @@ router.post("/view-entries", likeTaskController.getLikeLinkEntries);
 
 router.post("/employee-view-entries", likeTaskController.getEmployeeLikeLinkEntries);
 
+router.post(
+  "/videos",
+  likeTaskController.getLikeTaskVideoList
+);
+
+router.post(
+  "/video/employees",
+  likeTaskController.getLikeTaskEmployeesByVideo
+);
+
+router.post(
+  "/video/employee/users",
+  likeTaskController.getLikeTaskUsersByEmployee
+);
+
+router.post(
+  "/performance",
+  likeTaskController.getLikeTaskEmployeePerformance
+);
+
 module.exports = router;

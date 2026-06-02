@@ -42,6 +42,12 @@ const EmailSlotSchema = new mongoose.Schema(
       default: false,
     },
 
+    verificationState: {
+      type: String,
+      enum: ["pending", "verified", "failed"],
+      default: "pending",
+    },
+
     verificationReason: {
       type: String,
       default: "",
@@ -104,6 +110,7 @@ const TaskSchema = new mongoose.Schema(
       type: String,
       ref: "User",
       required: true,
+      index: true,
     },
 
     likeLinkId: {
@@ -118,6 +125,8 @@ const TaskSchema = new mongoose.Schema(
       default: 0,
     },
 
+    // Existing admin/payment approval status.
+    // Keep this numeric field unchanged so old functionality does not break.
     status: {
       type: Number,
       enum: [0, 1],
@@ -143,6 +152,8 @@ const TaskSchema = new mongoose.Schema(
 );
 
 TaskSchema.index({ userId: 1, likeLinkId: 1 }, { unique: true });
+TaskSchema.index({ likeLinkId: 1, createdAt: -1 });
+TaskSchema.index({ userId: 1, createdAt: -1 });
 
 TaskSchema.pre("validate", async function (next) {
   try {
@@ -150,10 +161,26 @@ TaskSchema.pre("validate", async function (next) {
       this.emailSlots = [];
     }
 
+    const maxEmailsAllowed = Math.floor(Number(this.maxEmailsAllowed || 0));
+
+    if (!Number.isFinite(maxEmailsAllowed) || maxEmailsAllowed <= 0) {
+      this.maxEmailsAllowed = 1;
+    } else {
+      this.maxEmailsAllowed = maxEmailsAllowed;
+    }
+
     if (this.emailSlots.length > this.maxEmailsAllowed) {
       return next(
         new Error(`Only ${this.maxEmailsAllowed} different emails are allowed per task`)
       );
+    }
+
+    for (const slot of this.emailSlots) {
+      slot.email = String(slot.email || "").trim().toLowerCase();
+
+      if (!slot.verificationState) {
+        slot.verificationState = slot.verified ? "verified" : "pending";
+      }
     }
 
     const normalized = this.emailSlots.map((x) =>
@@ -176,9 +203,9 @@ TaskSchema.pre("validate", async function (next) {
       this.amount = Number(likeLink.amount || 0);
     }
 
-    next();
+    return next();
   } catch (err) {
-    next(err);
+    return next(err);
   }
 });
 

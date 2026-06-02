@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const multer = require("multer");
 const mongoose = require("mongoose");
 const { google } = require("googleapis");
+const Employee = require("../models/Employee");
 
 const Task = require("../models/likeTask");
 const LikeLink = require("../models/likeLink");
@@ -180,6 +181,162 @@ function extractYouTubeVideoId(videoUrl = "") {
     } catch (_) {
         return "";
     }
+}
+
+function buildLikeLinkIdMatch(linkIds = []) {
+    const stringIds = linkIds.map((id) => String(id)).filter(Boolean);
+
+    const objectIds = stringIds
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+        .map((id) => new mongoose.Types.ObjectId(id));
+
+    return {
+        $or: [
+            { likeLinkId: { $in: stringIds } },
+            { likeLinkId: { $in: objectIds } },
+        ],
+    };
+}
+
+function getYoutubeThumbnail(videoUrl = "") {
+    const videoId = extractYouTubeVideoId(videoUrl);
+
+    return videoId
+        ? `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
+        : "";
+}
+
+function isFailedLikeSlot(slot = {}) {
+    return (
+        slot.verificationState === "failed" ||
+        slot.verificationMessage === LIKE_NOT_DETECTED_MESSAGE ||
+        (
+            slot.submittedAt &&
+            slot.verified !== true &&
+            String(slot.youtubeRating || "").toLowerCase() === "none"
+        )
+    );
+}
+
+function deriveLikeReportStatus(task, likeLink) {
+    const maxEmailsAllowed = task
+        ? Number(task.maxEmailsAllowed || getMaxEmailsAllowedFromLikeLink(likeLink))
+        : getMaxEmailsAllowedFromLikeLink(likeLink);
+
+    const requiredLikes =
+        Number.isFinite(maxEmailsAllowed) && maxEmailsAllowed > 0
+            ? maxEmailsAllowed
+            : 1;
+
+    const emailSlots = Array.isArray(task?.emailSlots) ? task.emailSlots : [];
+
+    const verifiedLikes = emailSlots.filter((slot) => slot.verified === true).length;
+    const failedLikes = emailSlots.filter(isFailedLikeSlot).length;
+    const accountsLinked = emailSlots.length;
+
+    let status = "Not Started";
+
+    /*
+      Reporting rules:
+      - Approved: all required likes are verified, e.g. 5/5 or 10/10.
+      - Partial: one or more likes failed verification.
+      - Pending: verification has started and is still in progress.
+        Example: 2/5 verified and 0 failed is Pending.
+      - Not Started: no task exists or no linked/authenticated email slots yet.
+    */
+    if (!task || accountsLinked === 0) {
+        status = "Not Started";
+    } else if (verifiedLikes >= requiredLikes) {
+        status = "Approved";
+    } else if (failedLikes > 0) {
+        status = "Partial";
+    } else {
+        status = "Pending";
+    }
+
+    return {
+        status,
+        requiredLikes,
+        verifiedLikes,
+        failedLikes,
+        accountsLinked,
+    };
+}
+
+function makeEmptyCounts() {
+    return {
+        approvedCount: 0,
+        pendingCount: 0,
+        partialCount: 0,
+        notStartedCount: 0,
+    };
+}
+
+function addStatusToCounts(counts, status) {
+    if (status === "Approved") {
+        counts.approvedCount += 1;
+    } else if (status === "Partial") {
+        counts.partialCount += 1;
+    } else if (status === "Pending") {
+        counts.pendingCount += 1;
+    } else {
+        counts.notStartedCount += 1;
+    }
+}
+
+function getBonusSlab(averageActiveUsers) {
+    const avg = Number(averageActiveUsers || 0);
+
+    if (avg < 90) {
+        return {
+            applicableBonusSlab: "Below 90 active users",
+            bonusRate: 0,
+        };
+    }
+
+    if (avg <= 120) {
+        return {
+            applicableBonusSlab: "90 to 120 active users",
+            bonusRate: 20,
+        };
+    }
+
+    return {
+        applicableBonusSlab: "Above 120 active users",
+        bonusRate: 25,
+    };
+}
+
+function parseDashboardDateRange(startDate, endDate) {
+    if (!startDate) {
+        throw new Error("startDate is required");
+    }
+
+    const start = new Date(startDate);
+    const end = endDate ? new Date(endDate) : new Date(startDate);
+
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+        throw new Error("Invalid date range");
+    }
+
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    return { start, end };
+}
+
+function buildTaskMap(tasks = []) {
+    const map = new Map();
+
+    for (const task of tasks) {
+        map.set(`${String(task.likeLinkId)}::${String(task.userId)}`, task);
+    }
+
+    return map;
+}
+
+function getTaskFromMap(taskMap, likeLinkId, userId) {
+    return taskMap.get(`${String(likeLinkId)}::${String(userId)}`) || null;
 }
 
 async function findVerifiedEmailUsage(likeLinkId, email, excludeTaskMongoId = null) {
@@ -554,7 +711,9 @@ exports.googleCallback = asyncHandler(async (req, res) => {
             slot.authExpiresAt &&
             new Date(slot.authExpiresAt).getTime() > nowMs;
 
-        return isVerified || isActivePending || slotEmail === email;
+        const isFailed = isFailedLikeSlot(slot);
+
+        return isVerified || isActivePending || isFailed || slotEmail === email;
     });
 
     const usedEmails = new Set(
@@ -585,6 +744,7 @@ exports.googleCallback = asyncHandler(async (req, res) => {
         screenshotHash: null,
         submittedAt: null,
         verified: false,
+        verificationState: "pending",
         verificationReason: "",
         verificationMessage: "",
         verifiedBy: "youtube_api",
@@ -608,6 +768,7 @@ exports.googleCallback = asyncHandler(async (req, res) => {
             screenshotHash: slotData.screenshotHash,
             submittedAt: slotData.submittedAt,
             verified: slotData.verified,
+            verificationState: slotData.verificationState,
             verificationReason: slotData.verificationReason,
             verificationMessage: slotData.verificationMessage,
             verifiedBy: slotData.verifiedBy,
@@ -791,15 +952,31 @@ exports.submitScreenshotAndVerify = asyncHandler(async (req, res) => {
     }
 
     if (!verification.liked) {
-        task.emailSlots.splice(activeSlotIndex, 1);
-        task.markModified("emailSlots");
+        task.emailSlots[activeSlotIndex].email = email;
+        task.emailSlots[activeSlotIndex].submittedAt = new Date();
+        task.emailSlots[activeSlotIndex].verified = false;
+        task.emailSlots[activeSlotIndex].verificationState = "failed";
+        task.emailSlots[activeSlotIndex].verificationReason = verification.reason;
+        task.emailSlots[activeSlotIndex].verificationMessage = LIKE_NOT_DETECTED_MESSAGE;
+        task.emailSlots[activeSlotIndex].verifiedBy = "youtube_api";
+        task.emailSlots[activeSlotIndex].videoId = verification.videoId || "";
+        task.emailSlots[activeSlotIndex].youtubeRating = verification.rating || "none";
+        task.emailSlots[activeSlotIndex].youtubeApiResponse =
+            verification.youtubeApiResponse || null;
+        task.emailSlots[activeSlotIndex].authExpiresAt = new Date();
 
+        task.emailSlots[activeSlotIndex].accessToken = "";
+        task.emailSlots[activeSlotIndex].refreshToken = "";
+        task.emailSlots[activeSlotIndex].tokenExpiryDate = null;
+
+        task.markModified("emailSlots");
         await task.save();
 
         return res.status(400).json({
             error: LIKE_NOT_DETECTED_MESSAGE,
             message: LIKE_NOT_DETECTED_MESSAGE,
             email,
+            task: serializeTask(task, likeLink),
             verification: {
                 state: verification.state,
                 liked: verification.liked,
@@ -815,6 +992,7 @@ exports.submitScreenshotAndVerify = asyncHandler(async (req, res) => {
     task.emailSlots[activeSlotIndex].email = email;
     task.emailSlots[activeSlotIndex].submittedAt = new Date();
     task.emailSlots[activeSlotIndex].verified = true;
+    task.emailSlots[activeSlotIndex].verificationState = "verified";
     task.emailSlots[activeSlotIndex].verificationReason = verification.reason;
     task.emailSlots[activeSlotIndex].verificationMessage = LIKE_DETECTED_MESSAGE;
     task.emailSlots[activeSlotIndex].verifiedBy = "youtube_api";
@@ -909,6 +1087,7 @@ exports.getLikeLinkEntries = asyncHandler(async (req, res) => {
                 authExpiresAt: slot.authExpiresAt,
                 submittedAt: slot.submittedAt,
                 verified: slot.verified,
+                verificationState: slot.verificationState || (slot.verified ? "verified" : "pending"),
                 verificationReason: slot.verificationReason,
                 verificationMessage: slot.verificationMessage,
                 verifiedBy: slot.verifiedBy,
@@ -1068,6 +1247,7 @@ exports.getEmployeeLikeLinkEntries = asyncHandler(async (req, res) => {
                 authExpiresAt: slot.authExpiresAt,
                 submittedAt: slot.submittedAt,
                 verified: slot.verified,
+                verificationState: slot.verificationState || (slot.verified ? "verified" : "pending"),
                 verificationReason: slot.verificationReason,
                 verificationMessage: slot.verificationMessage,
                 verifiedBy: slot.verifiedBy,
@@ -1102,5 +1282,360 @@ exports.getEmployeeLikeLinkEntries = asyncHandler(async (req, res) => {
             hasPrevPage: page > 1,
         },
         entries,
+    });
+});
+
+exports.getLikeTaskVideoList = asyncHandler(async (_req, res) => {
+    const employees = await Employee.find({ isApproved: 1 })
+        .select("employeeId name email")
+        .sort({ name: 1 })
+        .lean();
+
+    const employeeIds = employees.map((emp) => String(emp.employeeId));
+
+    const users = await User.find({ worksUnder: { $in: employeeIds } })
+        .select("userId name email phone worksUnder")
+        .lean();
+
+    const likeLinks = await LikeLink.find()
+        .select("title videoUrl createdBy createdAt target amount expireIn requireLike")
+        .sort({ createdAt: -1 })
+        .lean();
+
+    const likeLinkIds = likeLinks.map((link) => link._id);
+    const userIds = users.map((user) => user.userId);
+
+    const tasks =
+        likeLinkIds.length && userIds.length
+            ? await Task.find({
+                  ...buildLikeLinkIdMatch(likeLinkIds),
+                  userId: { $in: userIds },
+              }).lean()
+            : [];
+
+    const taskMap = buildTaskMap(tasks);
+
+    const videos = likeLinks.map((likeLink) => {
+        const counts = makeEmptyCounts();
+
+        for (const user of users) {
+            const task = getTaskFromMap(taskMap, likeLink._id, user.userId);
+            const derived = deriveLikeReportStatus(task, likeLink);
+
+            addStatusToCounts(counts, derived.status);
+        }
+
+        const expireAt = new Date(likeLink.createdAt);
+        expireAt.setHours(expireAt.getHours() + Number(likeLink.expireIn || 0));
+
+        return {
+            likeLinkId: String(likeLink._id),
+            videoTitle: likeLink.title,
+            videoUrl: likeLink.videoUrl,
+            thumbnail: getYoutubeThumbnail(likeLink.videoUrl),
+            totalTaskCount: users.length,
+            totalEmployeesWorking: employees.length,
+            approvedCount: counts.approvedCount,
+            pendingCount: counts.pendingCount,
+            partialCount: counts.partialCount,
+            notStartedCount: counts.notStartedCount,
+            createdAt: likeLink.createdAt,
+            expireAt,
+        };
+    });
+
+    return res.json({
+        total: videos.length,
+        videos,
+    });
+});
+
+exports.getLikeTaskEmployeesByVideo = asyncHandler(async (req, res) => {
+    const { likeLinkId } = req.body;
+
+    if (!likeLinkId) {
+        return badRequest(res, "likeLinkId is required");
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(likeLinkId)) {
+        return badRequest(res, "Invalid likeLinkId");
+    }
+
+    const likeLink = await LikeLink.findById(likeLinkId).lean();
+
+    if (!likeLink) {
+        return notFound(res, "Like link not found");
+    }
+
+    const employees = await Employee.find({ isApproved: 1 })
+        .select("employeeId name email")
+        .sort({ name: 1 })
+        .lean();
+
+    const employeeIds = employees.map((emp) => String(emp.employeeId));
+
+    const users = await User.find({ worksUnder: { $in: employeeIds } })
+        .select("userId name email phone worksUnder")
+        .lean();
+
+    const userIds = users.map((user) => user.userId);
+
+    const tasks = userIds.length
+        ? await Task.find({
+              ...buildLikeLinkIdMatch([likeLink._id]),
+              userId: { $in: userIds },
+          }).lean()
+        : [];
+
+    const taskMap = buildTaskMap(tasks);
+
+    const usersByEmployee = users.reduce((acc, user) => {
+        const key = String(user.worksUnder || "");
+
+        if (!acc[key]) {
+            acc[key] = [];
+        }
+
+        acc[key].push(user);
+        return acc;
+    }, {});
+
+    const employeeRows = employees.map((employee) => {
+        const employeeUsers = usersByEmployee[String(employee.employeeId)] || [];
+        const counts = makeEmptyCounts();
+
+        for (const user of employeeUsers) {
+            const task = getTaskFromMap(taskMap, likeLink._id, user.userId);
+            const derived = deriveLikeReportStatus(task, likeLink);
+
+            addStatusToCounts(counts, derived.status);
+        }
+
+        return {
+            employeeId: employee.employeeId,
+            employeeName: employee.name,
+            email: employee.email,
+            totalUsers: employeeUsers.length,
+            approvedCount: counts.approvedCount,
+            pendingCount: counts.pendingCount,
+            partialCount: counts.partialCount,
+            notStartedCount: counts.notStartedCount,
+        };
+    });
+
+    return res.json({
+        likeLink: {
+            likeLinkId: String(likeLink._id),
+            videoTitle: likeLink.title,
+            videoUrl: likeLink.videoUrl,
+            thumbnail: getYoutubeThumbnail(likeLink.videoUrl),
+        },
+        total: employeeRows.length,
+        employees: employeeRows,
+    });
+});
+
+exports.getLikeTaskUsersByEmployee = asyncHandler(async (req, res) => {
+    const { likeLinkId, employeeId } = req.body;
+
+    if (!likeLinkId) {
+        return badRequest(res, "likeLinkId is required");
+    }
+
+    if (!employeeId) {
+        return badRequest(res, "employeeId is required");
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(likeLinkId)) {
+        return badRequest(res, "Invalid likeLinkId");
+    }
+
+    const [likeLink, employee] = await Promise.all([
+        LikeLink.findById(likeLinkId).lean(),
+        Employee.findOne({ employeeId: String(employeeId) })
+            .select("employeeId name email")
+            .lean(),
+    ]);
+
+    if (!likeLink) {
+        return notFound(res, "Like link not found");
+    }
+
+    if (!employee) {
+        return notFound(res, "Employee not found");
+    }
+
+    const users = await User.find({ worksUnder: String(employeeId) })
+        .select("userId name email phone worksUnder")
+        .sort({ name: 1 })
+        .lean();
+
+    const userIds = users.map((user) => user.userId);
+
+    const tasks = userIds.length
+        ? await Task.find({
+              ...buildLikeLinkIdMatch([likeLink._id]),
+              userId: { $in: userIds },
+          }).lean()
+        : [];
+
+    const taskMap = buildTaskMap(tasks);
+
+    const userRows = users.map((user) => {
+        const task = getTaskFromMap(taskMap, likeLink._id, user.userId);
+        const derived = deriveLikeReportStatus(task, likeLink);
+
+        return {
+            userId: user.userId,
+            userName: user.name,
+            email: user.email,
+            phone: user.phone,
+            accountsLinked: derived.accountsLinked,
+            verificationCount: derived.verifiedLikes,
+            requiredLikes: derived.requiredLikes,
+            failedLikes: derived.failedLikes,
+            status: derived.status,
+        };
+    });
+
+    const statusRank = {
+        Approved: 0,
+        Partial: 1,
+        Pending: 2,
+        "Not Started": 3,
+    };
+
+    userRows.sort((a, b) => {
+        const aRank = statusRank[a.status] ?? 4;
+        const bRank = statusRank[b.status] ?? 4;
+
+        if (aRank !== bRank) {
+            return aRank - bRank;
+        }
+
+        return String(a.userName || a.email || a.userId || "").localeCompare(
+            String(b.userName || b.email || b.userId || "")
+        );
+    });
+
+    return res.json({
+        likeLink: {
+            likeLinkId: String(likeLink._id),
+            videoTitle: likeLink.title,
+            videoUrl: likeLink.videoUrl,
+            thumbnail: getYoutubeThumbnail(likeLink.videoUrl),
+        },
+        employee: {
+            employeeId: employee.employeeId,
+            employeeName: employee.name,
+            email: employee.email,
+        },
+        total: userRows.length,
+        users: userRows,
+    });
+});
+
+exports.getLikeTaskEmployeePerformance = asyncHandler(async (req, res) => {
+    const { employeeId, startDate, endDate } = req.body;
+
+    if (!employeeId) {
+        return badRequest(res, "employeeId is required");
+    }
+
+    let range;
+
+    try {
+        range = parseDashboardDateRange(startDate, endDate);
+    } catch (err) {
+        return badRequest(res, err.message || "Invalid date range");
+    }
+
+    const employee = await Employee.findOne({ employeeId: String(employeeId) })
+        .select("employeeId name email")
+        .lean();
+
+    if (!employee) {
+        return notFound(res, "Employee not found");
+    }
+
+    const likeLinks = await LikeLink.find({
+        createdAt: {
+            $gte: range.start,
+            $lte: range.end,
+        },
+    })
+        .select("title videoUrl createdAt target amount expireIn requireLike")
+        .sort({ createdAt: 1 })
+        .lean();
+
+    const users = await User.find({ worksUnder: String(employeeId) })
+        .select("userId name worksUnder")
+        .lean();
+
+    const userIds = users.map((user) => user.userId);
+    const likeLinkIds = likeLinks.map((link) => link._id);
+
+    const tasks =
+        likeLinkIds.length && userIds.length
+            ? await Task.find({
+                  ...buildLikeLinkIdMatch(likeLinkIds),
+                  userId: { $in: userIds },
+              }).lean()
+            : [];
+
+    const taskMap = buildTaskMap(tasks);
+
+    let totalApprovedActiveUsers = 0;
+
+    const videoBreakdown = likeLinks.map((likeLink) => {
+        let approvedActiveUsers = 0;
+
+        for (const user of users) {
+            const task = getTaskFromMap(taskMap, likeLink._id, user.userId);
+            const derived = deriveLikeReportStatus(task, likeLink);
+
+            if (derived.status === "Approved") {
+                approvedActiveUsers += 1;
+            }
+        }
+
+        totalApprovedActiveUsers += approvedActiveUsers;
+
+        return {
+            likeLinkId: String(likeLink._id),
+            videoTitle: likeLink.title,
+            videoUrl: likeLink.videoUrl,
+            thumbnail: getYoutubeThumbnail(likeLink.videoUrl),
+            approvedActiveUsers,
+        };
+    });
+
+    const totalVideos = likeLinks.length;
+
+    const averageActiveUsers =
+        totalVideos > 0
+            ? Number((totalApprovedActiveUsers / totalVideos).toFixed(2))
+            : 0;
+
+    const bonus = getBonusSlab(averageActiveUsers);
+    const totalBonus = Number((averageActiveUsers * bonus.bonusRate).toFixed(2));
+
+    return res.json({
+        employee: {
+            employeeId: employee.employeeId,
+            employeeName: employee.name,
+            email: employee.email,
+        },
+        period: {
+            startDate: range.start,
+            endDate: range.end,
+        },
+        totalVideos,
+        totalApprovedActiveUsers,
+        averageActiveUsers,
+        applicableBonusSlab: bonus.applicableBonusSlab,
+        bonusRate: bonus.bonusRate,
+        totalBonus,
+        videoBreakdown,
     });
 });
