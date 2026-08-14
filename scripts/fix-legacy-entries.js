@@ -82,14 +82,25 @@ const COLLECTION = process.env.ENTRIES_COLLECTION || 'entries';
     }
 
     const ids = employeeShaped.map((e) => e._id);
-    const r1 = await entries.updateMany({ _id: { $in: ids } }, { $set: { type: 0 } });
+    const r1 = await entries.updateMany(
+      { _id: { $in: ids } },
+      { $set: { type: 0, isLegacy: true, legacyFixedAt: new Date() } }
+    );
     const r2 = await entries.updateMany(
       { _id: { $in: ids }, status: { $exists: false } },
       { $set: { status: null } }
     );
-    console.log(`\n✅ type set on ${r1.modifiedCount} rows`);
+    console.log(`\n✅ type + isLegacy set on ${r1.modifiedCount} rows`);
     console.log(`✅ status initialised on ${r2.modifiedCount} rows`);
-    console.log('\n✅ done. These entries can now be approved and will debit correctly.\n');
+    console.log(
+      '\n🔒 These rows are marked isLegacy — employees CANNOT approve them until an\n' +
+        '   admin releases them via POST /admin/entries/legacy/release.\n' +
+        '   Review what is locked with GET /admin/entries/legacy\n'
+    );
+    console.log('↩️  To reverse this migration entirely:');
+    console.log(
+      '   db.entries.updateMany({ isLegacy: true }, { $unset: { type: "", status: "", isLegacy: "", legacyFixedAt: "" } })\n'
+    );
   } catch (err) {
     console.error('❌ failed:', err);
     process.exitCode = 1;

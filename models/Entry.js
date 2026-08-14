@@ -35,6 +35,11 @@ const entrySchema = new mongoose.Schema({
   isUpdated:  { type: Number, default: 0 },
   createdAt:  { type: Date, default: Date.now },
 
+  isLegacy:         { type: Boolean, default: false },
+  legacyFixedAt:    { type: Date },
+  legacyReleasedAt: { type: Date },
+  legacyReleasedBy: { type: String },
+
   history: [{
     field:     { type: String, required: true },
     from:      { type: mongoose.Schema.Types.Mixed },

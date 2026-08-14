@@ -1131,6 +1131,18 @@ exports.setEntryStatus = asyncHandler(async (req, res) => {
         return;
       }
 
+      const isLegacyLocked =
+        newStatus === 1 &&
+        !entry.legacyReleasedAt &&
+        (entry.isLegacy === true || entry.type == null);
+
+      if (isLegacyLocked) {
+        throw codedError(
+          "LEGACY_ENTRY_LOCKED",
+          "This entry predates the current payout system and needs admin release before it can be approved."
+        );
+      }
+
       const { employeeId: targetEmpId, amount } = resolveEntryPayout(entry);
       if (!targetEmpId) {
         throw codedError(
@@ -1206,6 +1218,10 @@ exports.setEntryStatus = asyncHandler(async (req, res) => {
         return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee to debit not found");
       case "INVALID_DEDUCTION":
         return badRequest(res, "INVALID_DEDUCTION", err.message);
+      case "LEGACY_ENTRY_LOCKED":
+        return res
+          .status(423)
+          .json({ code: "LEGACY_ENTRY_LOCKED", message: err.message });
       case "STATUS_CHANGED":
         return res.status(409).json({ code: "STATUS_CHANGED", message: err.message });
       case "INSUFFICIENT_BALANCE":

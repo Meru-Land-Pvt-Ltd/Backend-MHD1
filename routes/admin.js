@@ -40,6 +40,14 @@ router.post('/links/entries', ctrl.getEntries);
 router.post('/links/summary', ctrl.getLinkSummary);
 
 /* ------------------------------------------------------------------ */
+/*  Legacy entry release (pre-`type` rows, locked until admin releases) */
+/* ------------------------------------------------------------------ */
+router.get('/entries/legacy',          ctrl.listLegacyEntries);
+router.post('/entries/legacy',         ctrl.listLegacyEntries);
+router.post('/entries/legacy/release', ctrl.releaseLegacyEntries);
+router.post('/entries/legacy/lock',    ctrl.lockLegacyEntries);
+
+/* ------------------------------------------------------------------ */
 /*  Balance management routes                                         */
 /* ------------------------------------------------------------------ */
 // Add balance to an employee

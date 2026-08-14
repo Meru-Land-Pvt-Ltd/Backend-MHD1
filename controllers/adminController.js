@@ -458,6 +458,92 @@ exports.getBalanceHistory = asyncHandler(async (req, res) => {
   res.json({ history, total, totalAmount, page: Number(page), pages: Math.ceil(total / limit) });
 });
 
+// Review what is still locked, by employee.
+exports.listLegacyEntries = asyncHandler(async (req, res) => {
+  const { employeeId, released } = { ...req.query, ...req.body };
+
+  const filter = { isLegacy: true };
+  if (employeeId) filter.employeeId = employeeId;
+  if (released === true || released === "true") {
+    filter.legacyReleasedAt = { $ne: null };
+  } else if (released === false || released === "false") {
+    filter.legacyReleasedAt = null;
+  }
+
+  const rows = await Entry.find(filter)
+    .select(
+      "entryId employeeId linkId name upiId amount status createdAt legacyReleasedAt legacyReleasedBy"
+    )
+    .sort({ createdAt: 1 })
+    .lean();
+
+  const byEmployee = {};
+  for (const r of rows) {
+    const b = (byEmployee[r.employeeId] ||= { count: 0, amount: 0, released: 0 });
+    b.count += 1;
+    b.amount += Number(r.amount || 0);
+    if (r.legacyReleasedAt) b.released += 1;
+  }
+
+  res.json({
+    total: rows.length,
+    totalAmount: rows.reduce((s, r) => s + Number(r.amount || 0), 0),
+    byEmployee,
+    rows,
+  });
+});
+
+exports.releaseLegacyEntries = asyncHandler(async (req, res) => {
+  const { entryIds, employeeId, adminId } = req.body || {};
+  if (!adminId) return badRequest(res, "adminId is required");
+
+  const hasIds = Array.isArray(entryIds) && entryIds.length;
+  if (!hasIds && !employeeId) {
+    return badRequest(res, "Provide entryIds or an employeeId to release");
+  }
+
+  const filter = { isLegacy: true, legacyReleasedAt: null };
+  if (hasIds) filter.entryId = { $in: entryIds };
+  if (employeeId) filter.employeeId = employeeId;
+
+  const targets = await Entry.find(filter).select("entryId amount").lean();
+  if (!targets.length) {
+    return res.json({ message: "Nothing to release", released: 0, amount: 0 });
+  }
+
+  const result = await Entry.updateMany(filter, {
+    $set: { legacyReleasedAt: new Date(), legacyReleasedBy: String(adminId) },
+  });
+
+  res.json({
+    message: "Legacy entries released for approval",
+    released: result.modifiedCount,
+    amount: targets.reduce((s, t) => s + Number(t.amount || 0), 0),
+    entryIds: targets.map((t) => t.entryId),
+  });
+});
+
+// Undo a release; only affects entries not yet approved.
+exports.lockLegacyEntries = asyncHandler(async (req, res) => {
+  const { entryIds, employeeId, adminId } = req.body || {};
+  if (!adminId) return badRequest(res, "adminId is required");
+
+  const hasIds = Array.isArray(entryIds) && entryIds.length;
+  if (!hasIds && !employeeId) {
+    return badRequest(res, "Provide entryIds or an employeeId to lock");
+  }
+
+  const filter = { isLegacy: true, status: { $ne: 1 } };
+  if (hasIds) filter.entryId = { $in: entryIds };
+  if (employeeId) filter.employeeId = employeeId;
+
+  const result = await Entry.updateMany(filter, {
+    $unset: { legacyReleasedAt: "", legacyReleasedBy: "" },
+  });
+
+  res.json({ message: "Legacy entries locked", locked: result.modifiedCount });
+});
+
 exports.addEmployeeBalance = asyncHandler(async (req, res) => {
   const { employeeId, amount, adminId, note = "" } = req.body;
   if (!employeeId || amount == null || !adminId) {
