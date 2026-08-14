@@ -13,6 +13,9 @@ router.get('/links/:linkId', employeeController.getLink);
 
 // balance check
 router.get('/balance',    employeeController.getBalance);
+// full statement: every credit and payout for this employee
+router.get('/balance-history',  employeeController.getMyBalanceHistory);
+router.post('/balance-history', employeeController.getMyBalanceHistory);
 
 router.get('/emailtasks', employeeController.listEmailTasks);
 router.post('/taskbyuser', employeeController.taskByUser);

@@ -123,6 +123,51 @@ exports.getBalance = asyncHandler(async (req, res) => {
   res.json({ balance: employee.balance });
 });
 
+exports.getMyBalanceHistory = asyncHandler(async (req, res) => {
+  const { employeeId, page = 1, limit = 50 } = { ...req.query, ...req.body };
+  if (!employeeId) return badRequest(res, 'Employee ID is required');
+
+  const employee = await Employee.findOne({ employeeId }).select('balance').lean();
+  if (!employee) return notFound(res, 'Employee not found');
+
+  const pageNum = Math.max(1, Number(page) || 1);
+  const perPage = Math.min(200, Math.max(1, Number(limit) || 50));
+
+  const [rows, total, totals] = await Promise.all([
+    BalanceHistory.find({ employeeId })
+      .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * perPage)
+      .limit(perPage)
+      .lean(),
+    BalanceHistory.countDocuments({ employeeId }),
+    BalanceHistory.aggregate([
+      { $match: { employeeId } },
+      {
+        $group: {
+          _id: null,
+          credited: { $sum: { $cond: [{ $gt: ['$amount', 0] }, '$amount', 0] } },
+          debited: { $sum: { $cond: [{ $lt: ['$amount', 0] }, '$amount', 0] } },
+        },
+      },
+    ]),
+  ]);
+
+  res.json({
+    balance: employee.balance,
+    totals: {
+      credited: totals[0]?.credited || 0,
+      debited: Math.abs(totals[0]?.debited || 0),
+    },
+    rows: rows.map((r) => ({
+      ...r,
+      direction: r.amount < 0 ? 'debit' : 'credit',
+    })),
+    total,
+    page: pageNum,
+    pages: Math.ceil(total / perPage),
+  });
+});
+
 /* ====================== links ====================== */
 
 exports.listLinks = asyncHandler(async (_req, res) => {
@@ -210,10 +255,6 @@ exports.listEmailTasks = asyncHandler(async (_req, res) => {
   res.json(tasks);
 });
 
-/* ====================== task by user under employee ====================== */
-/* ✅ do NOT show EmailContact where isValid === false
-   ✅ show meta details: followerCount/country/categories + task min/max + countries label
-*/
 exports.taskByUser = asyncHandler(async (req, res) => {
   const { taskId, employeeId } = req.body || {};
   if (!taskId || !employeeId) return badRequest(res, 'taskId and employeeId are required');

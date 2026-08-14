@@ -26,6 +26,7 @@ const entrySchema = new mongoose.Schema({
   userId:      { type: String, ref: 'User' },
   worksUnder:  { type: String, ref: 'Employee' },
   linkAmount:  { type: Number },
+  noOfPersons: { type: Number, default: 1 },
   totalAmount: { type: Number },
 
   // still named screenshotId for compatibility (now it points to API verification doc)
@@ -43,8 +44,13 @@ const entrySchema = new mongoose.Schema({
 });
 
 entrySchema.index(
-  { linkId: 1 },
+  { linkId: 1, upiId: 1 },
   { unique: true, partialFilterExpression: { type: 0 } }
+);
+
+entrySchema.index(
+  { userId: 1, linkId: 1 },
+  { unique: true, partialFilterExpression: { type: 1 } }
 );
 
 module.exports = mongoose.model('Entry', entrySchema);

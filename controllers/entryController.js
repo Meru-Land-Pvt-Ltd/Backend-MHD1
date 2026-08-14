@@ -14,6 +14,7 @@ const User = require("../models/User");
 const Screenshot = require("../models/Screenshot");
 const LikeTask = require("../models/likeTask");
 const LikeLink = require("../models/likeLink");
+const BalanceHistory = require("../models/BalanceHistory");
 
 /* ------------------------ utils & helpers ------------------------ */
 const asyncHandler =
@@ -213,6 +214,70 @@ async function ytListRepliesByParent(parentId, pageToken = null) {
     throw new Error(msg);
   }
   return resp.data || {};
+}
+
+/* ------------------------- money helpers ------------------------- */
+
+function resolveEntryPayout(entry) {
+  const isEmployeeEntry =
+    entry.type === 0 || (entry.type == null && entry.employeeId && !entry.userId);
+  const isUserEntry = entry.type === 1 || (entry.type == null && entry.userId);
+
+  if (isEmployeeEntry) {
+    return {
+      employeeId: entry.employeeId || null,
+      amount: Number(entry.amount ?? NaN),
+    };
+  }
+  if (isUserEntry) {
+    return {
+      employeeId: entry.worksUnder || null,
+      amount: Number(entry.totalAmount ?? entry.linkAmount ?? NaN),
+    };
+  }
+  return { employeeId: null, amount: NaN };
+}
+
+const codedError = (code, message) => {
+  const err = new Error(message || code);
+  err.code = code;
+  return err;
+};
+
+async function applyBalanceDelta({ employeeId, delta, note, addedBy, session }) {
+  if (!delta) return null;
+
+  const filter =
+    delta < 0
+      ? { employeeId, balance: { $gte: Math.abs(delta) } }
+      : { employeeId };
+
+  const emp = await Employee.findOneAndUpdate(
+    filter,
+    { $inc: { balance: delta } },
+    { new: true, session }
+  );
+
+  if (!emp) {
+    const exists = await Employee.exists({ employeeId }).session(session);
+    throw exists
+      ? codedError("INSUFFICIENT_BALANCE", "Insufficient balance")
+      : codedError("EMPLOYEE_NOT_FOUND", "Employee not found");
+  }
+
+  await BalanceHistory.create(
+    [
+      {
+        employeeId,
+        amount: delta,
+        addedBy: String(addedBy || employeeId),
+        note,
+      },
+    ],
+    { session }
+  );
+
+  return emp.balance;
 }
 
 /* ------------------------------------------------------------------ */
@@ -844,7 +909,7 @@ exports.listEntries = asyncHandler(async (req, res) => {
   if (!employeeId)
     return badRequest(res, "VALIDATION_ERROR", "employeeId required");
 
-  const filter = { employeeId };
+  const filter = { $or: [{ employeeId }, { worksUnder: employeeId }] };
 
   const [entries, total] = await Promise.all([
     Entry.find(filter)
@@ -885,6 +950,9 @@ exports.updateEntry = asyncHandler(async (req, res) => {
   if (!entry) return notFound(res, "ENTRY_NOT_FOUND", "Entry not found");
 
   const changes = [];
+  const isPaid = entry.status === 1;
+  let balanceDelta = 0;
+  let debitEmployeeId = null;
 
   if (entry.type === 0) {
     if (!name || !upiId || amount == null) {
@@ -921,15 +989,18 @@ exports.updateEntry = asyncHandler(async (req, res) => {
 
     if (Number(entry.amount) !== Number(amount)) {
       const diff = Number(amount) - Number(entry.amount);
-      if (diff > 0 && emp.balance < diff) {
-        return badRequest(res, "INSUFFICIENT_BALANCE", "Insufficient balance");
+      if (!Number.isFinite(diff)) {
+        return badRequest(res, "VALIDATION_ERROR", "amount must be a number");
       }
 
       changes.push({ field: "amount", from: entry.amount, to: Number(amount) });
       entry.amount = Number(amount);
 
-      emp.balance -= diff;
-      await emp.save();
+      if (isPaid) {
+        // Already paid out: charge or refund only the difference.
+        balanceDelta = -diff;
+        debitEmployeeId = entry.employeeId;
+      }
     }
   } else {
     if (noOfPersons == null) {
@@ -941,8 +1012,15 @@ exports.updateEntry = asyncHandler(async (req, res) => {
     }
 
     const newCount = Number(noOfPersons);
+    if (!Number.isInteger(newCount) || newCount < 1) {
+      return badRequest(
+        res,
+        "VALIDATION_ERROR",
+        "noOfPersons must be a positive whole number"
+      );
+    }
 
-    if (entry.noOfPersons !== newCount) {
+    if (Number(entry.noOfPersons) !== newCount) {
       changes.push({
         field: "noOfPersons",
         from: entry.noOfPersons,
@@ -958,20 +1036,66 @@ exports.updateEntry = asyncHandler(async (req, res) => {
         from: entry.totalAmount,
         to: newTotal,
       });
+
+      if (isPaid) {
+        // Already paid out: charge or refund only the difference.
+        balanceDelta = Number(entry.totalAmount || 0) - newTotal;
+        debitEmployeeId = entry.worksUnder;
+      }
+
       entry.totalAmount = newTotal;
     }
   }
 
-  if (changes.length) {
-    entry.isUpdated = 1;
-    const timestamp = new Date();
-    changes.forEach((c) => entry.history.push({ ...c, updatedAt: timestamp }));
+  if (!changes.length) {
+    return res.json({ message: "No changes detected", entry });
   }
 
-  await entry.save();
+  entry.isUpdated = 1;
+  const timestamp = new Date();
+  changes.forEach((c) => entry.history.push({ ...c, updatedAt: timestamp }));
+
+  // The edit and any balance correction it implies must land together.
+  const session = await mongoose.startSession();
+  let newBalance = null;
+
+  try {
+    await session.withTransaction(async () => {
+      await entry.save({ session });
+
+      if (balanceDelta && debitEmployeeId) {
+        newBalance = await applyBalanceDelta({
+          employeeId: debitEmployeeId,
+          delta: balanceDelta,
+          addedBy: entry.userId || entry.employeeId || debitEmployeeId,
+          note:
+            balanceDelta < 0
+              ? `Payout top-up ₹${Math.abs(balanceDelta)} — approved entry ${entryId} edited`
+              : `Refund ₹${balanceDelta} — approved entry ${entryId} edited down`,
+          session,
+        });
+      }
+    });
+  } catch (err) {
+    if (err.code === "INSUFFICIENT_BALANCE") {
+      return badRequest(
+        res,
+        "INSUFFICIENT_BALANCE",
+        "Insufficient balance to cover the increased amount"
+      );
+    }
+    if (err.code === "EMPLOYEE_NOT_FOUND") {
+      return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee to debit not found");
+    }
+    throw err;
+  } finally {
+    session.endSession();
+  }
+
   res.json({
-    message: changes.length ? "Entry updated" : "No changes detected",
+    message: "Entry updated",
     entry,
+    ...(newBalance !== null ? { newBalance } : {}),
   });
 });
 
@@ -988,76 +1112,114 @@ exports.setEntryStatus = asyncHandler(async (req, res) => {
     return badRequest(res, "VALIDATION_ERROR", "approve must be 0 or 1");
   }
 
-  const entry = await Entry.findOne({ entryId });
-  if (!entry) return notFound(res, "ENTRY_NOT_FOUND", "Entry not found");
+  const session = await mongoose.startSession();
+  let payload = null;
 
-  if (entry.status === newStatus) {
-    return res.json({
-      message: newStatus ? "Already approved" : "Already rejected",
-      entry: { entryId, status: entry.status },
-    });
-  }
+  try {
+    await session.withTransaction(async () => {
+      const entry = await Entry.findOne({ entryId }).session(session);
+      if (!entry) throw codedError("ENTRY_NOT_FOUND", "Entry not found");
 
-  if (newStatus === 1) {
-    let deduction = 0;
-    let targetEmpId = null;
+      const prevStatus = entry.status ?? null;
 
-    if (entry.type === 0 && entry.employeeId) {
-      deduction = Number(entry.amount || 0);
-      targetEmpId = entry.employeeId;
-    } else if (entry.type === 1 && entry.worksUnder) {
-      deduction = Number(entry.totalAmount || 0);
-      targetEmpId = entry.worksUnder;
-    }
+      if (prevStatus === newStatus) {
+        payload = {
+          message: newStatus ? "Already approved" : "Already rejected",
+          entry: { entryId, status: prevStatus },
+          alreadyInState: true,
+        };
+        return;
+      }
 
-    if (!targetEmpId || !Number.isFinite(deduction)) {
-      return badRequest(res, "INVALID_DEDUCTION", "Cannot determine deduction or employee");
-    }
+      const { employeeId: targetEmpId, amount } = resolveEntryPayout(entry);
+      if (!targetEmpId) {
+        throw codedError(
+          "INVALID_DEDUCTION",
+          "Cannot determine which employee to debit for this entry"
+        );
+      }
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw codedError(
+          "INVALID_DEDUCTION",
+          "Entry has no valid payout amount"
+        );
+      }
 
-    const employee = await Employee.findOne({ employeeId: targetEmpId });
-    if (!employee)
-      return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee to debit not found");
+      // Debit when moving into approved, refund when moving back out of it.
+      const wasPaid = prevStatus === 1;
+      const delta = newStatus === 1 ? -amount : wasPaid ? amount : 0;
 
-    if (employee.balance < deduction) {
-      return badRequest(
-        res,
-        "INSUFFICIENT_BALANCE",
-        "Insufficient balance. Please add funds before approval."
+      const updatedEntry = await Entry.findOneAndUpdate(
+        { entryId, status: prevStatus },
+        {
+          $set: { status: newStatus },
+          $push: {
+            history: {
+              field: "status",
+              from: prevStatus,
+              to: newStatus,
+              updatedAt: new Date(),
+            },
+          },
+        },
+        { new: true, session }
       );
-    }
 
-    await Employee.updateOne(
-      { employeeId: targetEmpId },
-      { $inc: { balance: -deduction } }
-    );
-  }
+      if (!updatedEntry) {
+        throw codedError(
+          "STATUS_CHANGED",
+          "This entry was updated by someone else. Refresh and try again."
+        );
+      }
 
-  const updatedEntry = await Entry.findOneAndUpdate(
-    { entryId, status: { $ne: newStatus } },
-    { status: newStatus },
-    { new: true }
-  );
+      const payee = entry.name || entry.userId || entry.employeeId || "";
+      const newBalance = await applyBalanceDelta({
+        employeeId: targetEmpId,
+        delta,
+        addedBy: entry.userId || entry.employeeId || targetEmpId,
+        note:
+          delta < 0
+            ? `Payout ₹${amount} — entry ${entryId} (${payee}, ${entry.upiId || "no UPI"})`
+            : `Refund ₹${amount} — entry ${entryId} un-approved (${payee})`,
+        session,
+      });
 
-  if (!updatedEntry) {
-    return res.json({
-      message: newStatus ? "Already approved" : "Already rejected",
-      entry: { entryId, status: newStatus },
+      payload = {
+        message: newStatus ? "Approved" : "Rejected",
+        entry: { entryId, status: newStatus },
+        ...(delta !== 0
+          ? {
+              employeeId: targetEmpId,
+              [delta < 0 ? "amountDeducted" : "amountRefunded"]: amount,
+              newBalance,
+            }
+          : {}),
+      };
     });
+
+    return res.json(payload);
+  } catch (err) {
+    switch (err.code) {
+      case "ENTRY_NOT_FOUND":
+        return notFound(res, "ENTRY_NOT_FOUND", err.message);
+      case "EMPLOYEE_NOT_FOUND":
+        return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee to debit not found");
+      case "INVALID_DEDUCTION":
+        return badRequest(res, "INVALID_DEDUCTION", err.message);
+      case "STATUS_CHANGED":
+        return res.status(409).json({ code: "STATUS_CHANGED", message: err.message });
+      case "INSUFFICIENT_BALANCE":
+        return badRequest(
+          res,
+          "INSUFFICIENT_BALANCE",
+          "Insufficient balance. Please add funds before approval."
+        );
+      default:
+        throw err;
+    }
+  } finally {
+    session.endSession();
   }
-
-  const payload = {
-    message: newStatus ? "Approved" : "Rejected",
-    entry: { entryId, status: newStatus },
-  };
-
-  if (newStatus === 1) {
-    const emp = await Employee.findOne({
-      employeeId: entry.type === 0 ? entry.employeeId : entry.worksUnder,
-    }).select("balance");
-    payload.newBalance = emp?.balance;
-  }
-
-  res.json(payload);
 });
 
 /* ------------------------------------------------------------------ */
@@ -1205,32 +1367,23 @@ exports.setLikeTaskStatus = asyncHandler(async (req, res) => {
         throw err;
       }
 
-      let newBalance = null;
-
-      // deduct only when approving
-      if (newStatus === 1) {
-        const employee = await Employee.findOne({ employeeId: targetEmployeeId }).session(session);
-
-        if (!employee) {
-          const err = new Error("Employee not found");
-          err.code = "EMPLOYEE_NOT_FOUND";
-          throw err;
-        }
-
-        if (Number(employee.balance || 0) < taskAmount) {
-          const err = new Error("Insufficient balance");
-          err.code = "INSUFFICIENT_BALANCE";
-          throw err;
-        }
-
-        employee.balance = Number(employee.balance || 0) - taskAmount;
-        await employee.save({ session });
-
-        newBalance = employee.balance;
-      }
+      // Debit when moving into approved, refund when moving back out of it.
+      const wasPaid = task.status === 1;
+      const delta = newStatus === 1 ? -taskAmount : wasPaid ? taskAmount : 0;
 
       task.status = newStatus;
       await task.save({ session });
+
+      const newBalance = await applyBalanceDelta({
+        employeeId: targetEmployeeId,
+        delta,
+        addedBy: task.userId || targetEmployeeId,
+        note:
+          delta < 0
+            ? `Payout ₹${taskAmount} — like task ${task.taskId} (${user.name || task.userId})`
+            : `Refund ₹${taskAmount} — like task ${task.taskId} un-approved (${user.name || task.userId})`,
+        session,
+      });
 
       responsePayload = {
         message: newStatus === 1 ? "Like task approved" : "Like task rejected",
@@ -1241,7 +1394,13 @@ exports.setLikeTaskStatus = asyncHandler(async (req, res) => {
           userId: task.userId,
           likeLinkId: String(task.likeLinkId),
         },
-        ...(newStatus === 1 ? { amountDeducted: taskAmount, newBalance } : {}),
+        ...(delta !== 0
+          ? {
+              employeeId: targetEmployeeId,
+              [delta < 0 ? "amountDeducted" : "amountRefunded"]: taskAmount,
+              newBalance,
+            }
+          : {}),
       };
     });
 
