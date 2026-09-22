@@ -24,6 +24,8 @@ router.post('/links/user-entries', ctrl.getUserEntriesByLinkAndEmployee);
 
 router.post('/employees/approve', ctrl.approveEmployee);
 router.post('/employees/reject', ctrl.rejectEmployee);
+router.post('/employees/delete', ctrl.deleteEmployee);
+router.delete('/employees/:employeeId', ctrl.deleteEmployee);
 router.get('/employees/pending', ctrl.listPendingEmployees);
 /* ------------------------------------------------------------------ */
 /*  Links routes                                                      */

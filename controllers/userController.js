@@ -96,6 +96,23 @@ exports.login = async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials.' });
     }
 
+    // A user account is only active while its parent employee exists and is approved.
+    // We intentionally keep user/history rows when an employee is deleted so reports and
+    // old task records remain intact, but those orphaned users must never be able to log in.
+    const manager = await Employee.findOne({
+      employeeId: String(user.worksUnder || '').trim(),
+      isApproved: 1,
+    })
+      .select('employeeId')
+      .lean();
+
+    if (!manager) {
+      return res.status(403).json({
+        message: 'Account disabled because the assigned employee is no longer active.',
+        code: 'EMPLOYEE_INACTIVE',
+      });
+    }
+
     return res.status(200).json({ message: 'Login Successful', userId: user.userId });
   } catch (err) {
     console.error(err);

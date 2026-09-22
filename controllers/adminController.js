@@ -178,6 +178,33 @@ exports.rejectEmployee = asyncHandler(async (req, res) => {
   res.json({ message: "Employee registration rejected and removed" });
 });
 
+// Permanently remove an employee account without deleting historical user/task data.
+// Users that still reference this employee are automatically blocked by userController.login.
+exports.deleteEmployee = asyncHandler(async (req, res) => {
+  const employeeId = String(req.body?.employeeId || req.params?.employeeId || '').trim();
+  if (!employeeId) return badRequest(res, "employeeId required");
+
+  const emp = await Employee.findOne({ employeeId })
+    .select('employeeId name email isApproved')
+    .lean();
+  if (!emp) return notFound(res, "Employee not found");
+
+  // Keep users and historical work records for reporting/audit purposes.
+  // Their login becomes invalid immediately because the parent Employee no longer exists.
+  const affectedUsers = await User.countDocuments({ worksUnder: employeeId });
+
+  const deleted = await Employee.deleteOne({ employeeId });
+  if (!deleted.deletedCount) return notFound(res, "Employee not found");
+
+  return res.json({
+    message: "Employee deleted successfully. Employee login and all users under this employee are now disabled.",
+    employeeId,
+    employeeName: emp.name,
+    affectedUsers,
+    historicalDataPreserved: true,
+  });
+});
+
 exports.listPendingEmployees = asyncHandler(async (_req, res) => {
   const pending = await Employee.find({ isApproved: false })
     .select("name email employeeId createdAt")
