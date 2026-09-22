@@ -15,6 +15,7 @@ const Screenshot = require("../models/Screenshot");
 const LikeTask = require("../models/likeTask");
 const LikeLink = require("../models/likeLink");
 const BalanceHistory = require("../models/BalanceHistory");
+const { buildDuplicateTextKey } = require("../utils/textNormalization");
 
 /* ------------------------ utils & helpers ------------------------ */
 const asyncHandler =
@@ -125,6 +126,74 @@ function normText(s) {
     .replace(/[^\w'\s]/g, "")
     .trim()
     .toLowerCase();
+}
+
+function findDuplicateTextKey(actions, kind) {
+  const seen = new Set();
+  for (const action of actions || []) {
+    if (action.kind !== kind) continue;
+    const key = buildDuplicateTextKey(action.text);
+    if (!key) continue;
+    if (seen.has(key)) return key;
+    seen.add(key);
+  }
+  return null;
+}
+
+async function findTextReuseByOtherUser({ linkId, userId, commentTextKeys, replyTextKeys }) {
+  const wantedComments = new Set(commentTextKeys || []);
+  const wantedReplies = new Set(replyTextKeys || []);
+
+  if (!wantedComments.size && !wantedReplies.size) return null;
+
+  // Fast path for records created/updated by the new text-uniqueness logic.
+  const fastOr = [];
+  if (wantedComments.size) fastOr.push({ commentTextKeys: { $in: [...wantedComments] } });
+  if (wantedReplies.size) fastOr.push({ replyTextKeys: { $in: [...wantedReplies] } });
+
+  if (fastOr.length) {
+    const hit = await Screenshot.findOne({
+      linkId,
+      verified: true,
+      userId: { $ne: String(userId) },
+      $or: fastOr,
+    })
+      .select("userId screenshotId commentTextKeys replyTextKeys")
+      .lean();
+
+    if (hit) {
+      const commentKey = (hit.commentTextKeys || []).find((x) => wantedComments.has(x));
+      if (commentKey) return { kind: "comment", textKey: commentKey, hit };
+      const replyKey = (hit.replyTextKeys || []).find((x) => wantedReplies.has(x));
+      if (replyKey) return { kind: "reply", textKey: replyKey, hit };
+    }
+  }
+
+  // Legacy fallback: old Screenshot rows do not have text-key arrays. Read only
+  // historical rows for this campaign and compare their stored verified text.
+  const legacyRows = await Screenshot.find({
+    linkId,
+    verified: true,
+    userId: { $ne: String(userId) },
+    textUniquenessVersion: { $ne: 1 },
+  })
+    .select("userId screenshotId actions.kind actions.text")
+    .lean();
+
+  for (const row of legacyRows) {
+    for (const action of row.actions || []) {
+      const key = buildDuplicateTextKey(action.text);
+      if (!key) continue;
+      if (action.kind === "comment" && wantedComments.has(key)) {
+        return { kind: "comment", textKey: key, hit: row };
+      }
+      if (action.kind === "reply" && wantedReplies.has(key)) {
+        return { kind: "reply", textKey: key, hit: row };
+      }
+    }
+  }
+
+  return null;
 }
 
 function chunk(arr, size) {
@@ -562,6 +631,13 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
       continue;
     }
 
+    const verifiedCommentText = top?.textOriginal || top?.textDisplay || "";
+    const commentTextKey = buildDuplicateTextKey(verifiedCommentText);
+    if (!commentTextKey) {
+      reasons.push(`COMMENT_TEXT_MISSING:${p.parentId}`);
+      continue;
+    }
+
     setDetectedChannel(author, "COMMENT");
 
     actions.push({
@@ -570,10 +646,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
       commentId: p.parentId,
       parentId: null,
       permalink: p.permalink,
-      text:
-        top?.textOriginal ||
-        (Array.isArray(commentTexts) ? commentTexts[i] : null) ||
-        null,
+      text: verifiedCommentText,
       authorChannelId: author,
       publishedAt: top?.publishedAt || null,
     });
@@ -660,13 +733,21 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
 
     setDetectedChannel(replyAuthor, "REPLY");
 
+    const verifiedReplyText = sn?.textOriginal || sn?.textDisplay || "";
+
     const wantText = Array.isArray(replyTexts) ? normText(replyTexts[i]) : null;
     if (wantText) {
-      const gotText = normText(sn?.textOriginal || "");
+      const gotText = normText(verifiedReplyText);
       if (gotText !== wantText) {
         reasons.push(`REPLY_TEXT_MISMATCH:${found.id}`);
         continue;
       }
+    }
+
+    const replyTextKey = buildDuplicateTextKey(verifiedReplyText);
+    if (!replyTextKey) {
+      reasons.push(`REPLY_TEXT_MISSING:${found.id}`);
+      continue;
     }
 
     usedReplyIds.add(found.id);
@@ -678,10 +759,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
       commentId: found.id,
       parentId,
       permalink: p.permalink,
-      text:
-        sn?.textOriginal ||
-        (Array.isArray(replyTexts) ? replyTexts[i] : null) ||
-        null,
+      text: verifiedReplyText,
       authorChannelId: replyAuthor,
       publishedAt: sn?.publishedAt || null,
     });
@@ -714,6 +792,23 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     }
   } catch {
     // ignore
+  }
+
+  // Block duplicate wording inside the SAME submission, even when YouTube IDs differ.
+  const duplicateCommentTextKey = findDuplicateTextKey(actions, "comment");
+  if (duplicateCommentTextKey) {
+    return res.status(409).json({
+      code: "DUPLICATE_COMMENT_TEXT_IN_SUBMISSION",
+      message: "Two or more submitted comments have the same text. Each comment must be unique.",
+    });
+  }
+
+  const duplicateReplyTextKey = findDuplicateTextKey(actions, "reply");
+  if (duplicateReplyTextKey) {
+    return res.status(409).json({
+      code: "DUPLICATE_REPLY_TEXT_IN_SUBMISSION",
+      message: "Two or more submitted replies have the same text. Each reply must be unique.",
+    });
   }
 
   const gotComments = actions.filter((a) => a.kind === "comment").length;
@@ -778,6 +873,37 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
+  // Block duplicate WORDING across different users in the SAME campaign.
+  // We compare normalized text derived from YouTube's verified response, not user input.
+  const commentTextKeys = uniq(
+    actions.filter((a) => a.kind === "comment").map((a) => buildDuplicateTextKey(a.text))
+  );
+  const replyTextKeys = uniq(
+    actions.filter((a) => a.kind === "reply").map((a) => buildDuplicateTextKey(a.text))
+  );
+
+  const textReuseByOtherUser = await findTextReuseByOtherUser({
+    linkId,
+    userId,
+    commentTextKeys,
+    replyTextKeys,
+  });
+
+  if (textReuseByOtherUser) {
+    const isComment = textReuseByOtherUser.kind === "comment";
+    return res.status(409).json({
+      code: isComment ? "COMMENT_TEXT_ALREADY_USED" : "REPLY_TEXT_ALREADY_USED",
+      message: isComment
+        ? "This comment wording has already been used in this campaign. Please write a unique comment."
+        : "This reply wording has already been used in this campaign. Please write a unique reply.",
+      conflict: {
+        byUserId: textReuseByOtherUser.hit?.userId,
+        screenshotId: textReuseByOtherUser.hit?.screenshotId,
+      },
+      verification: analysisPayload,
+    });
+  }
+
   // Build flattened arrays explicitly (works for both create + update)
   const commentIds = uniq(actions.filter(a => a.kind === "comment").map(a => a.commentId));
   const replyIds = uniq(actions.filter(a => a.kind === "reply").map(a => a.commentId));
@@ -797,6 +923,9 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
       // ensure arrays exist for your unique indexes
       screenshotDoc.commentIds = commentIds;
       screenshotDoc.replyIds = replyIds;
+      screenshotDoc.commentTextKeys = commentTextKeys;
+      screenshotDoc.replyTextKeys = replyTextKeys;
+      screenshotDoc.textUniquenessVersion = 1;
 
       await screenshotDoc.save(); // triggers schema validation hooks
     } else {
@@ -810,6 +939,9 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
         actions,
         commentIds,
         replyIds,
+        commentTextKeys,
+        replyTextKeys,
+        textUniquenessVersion: 1,
       });
     }
   } catch (e) {
@@ -832,6 +964,18 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
         return res.status(409).json({
           code: "REPLY_ALREADY_USED",
           message: "This reply was already used for this campaign by someone else.",
+        });
+      }
+      if (key.linkId && key.commentTextKeys) {
+        return res.status(409).json({
+          code: "COMMENT_TEXT_ALREADY_USED",
+          message: "This comment wording has already been used in this campaign. Please write a unique comment.",
+        });
+      }
+      if (key.linkId && key.replyTextKeys) {
+        return res.status(409).json({
+          code: "REPLY_TEXT_ALREADY_USED",
+          message: "This reply wording has already been used in this campaign. Please write a unique reply.",
         });
       }
       return res.status(409).json({

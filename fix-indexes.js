@@ -211,6 +211,21 @@ await ensureIndex(
       { unique: true, partialFilterExpression: { verified: true, replyIds: { $type: "array" } } }
     );
 
+    // New: block duplicate normalized comment/reply wording per campaign.
+    // Version=1 intentionally excludes legacy rows so index creation is safe even
+    // when historical campaigns already contain duplicate wording.
+    await ensureIndex(
+      screenshots,
+      { linkId: 1, commentTextKeys: 1 },
+      { unique: true, partialFilterExpression: { verified: true, textUniquenessVersion: 1 } }
+    );
+
+    await ensureIndex(
+      screenshots,
+      { linkId: 1, replyTextKeys: 1 },
+      { unique: true, partialFilterExpression: { verified: true, textUniquenessVersion: 1 } }
+    );
+
     // 6) Print final indexes
     console.log(`\n===== FINAL indexes (${APPLY ? "APPLIED" : "DRY RUN"}) =====`);
     await printIndexes(entries, ENTRIES_COLLECTION);

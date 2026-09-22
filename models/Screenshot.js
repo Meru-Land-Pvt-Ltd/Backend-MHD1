@@ -1,6 +1,7 @@
 // models/Screenshot.js  (API verification version)
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
+const { buildDuplicateTextKey } = require('../utils/textNormalization');
 
 const actionSchema = new mongoose.Schema(
   {
@@ -19,7 +20,7 @@ const actionSchema = new mongoose.Schema(
     // user-submitted permalink
     permalink: { type: String, required: true },
 
-    // optional (if you capture text on frontend)
+    // verified text returned by YouTube (frontend text is not trusted for duplicate checks)
     text: { type: String },
 
     // author channel id from API
@@ -50,6 +51,15 @@ const screenshotSchema = new mongoose.Schema(
     commentIds: [{ type: String }],
     replyIds: [{ type: String }],
 
+    // flattened normalized text keys for same-campaign uniqueness enforcement
+    commentTextKeys: [{ type: String }],
+    replyTextKeys: [{ type: String }],
+
+    // Only documents written by the new duplicate-text logic participate in
+    // the text-key unique indexes. This avoids startup/index failures caused
+    // by historical records that may already contain duplicate wording.
+    textUniquenessVersion: { type: Number },
+
     // store all verified actions
     actions: { type: [actionSchema], required: true },
 
@@ -68,15 +78,30 @@ screenshotSchema.pre('validate', function (next) {
       return next(new Error('actions required'));
     }
 
-    // derive commentIds/replyIds from actions
+    // derive IDs and normalized text keys from verified actions
     const commentIds = [];
     const replyIds = [];
+    const commentTextKeys = [];
+    const replyTextKeys = [];
+
     for (const a of this.actions) {
-      if (a.kind === 'comment') commentIds.push(a.commentId);
-      if (a.kind === 'reply') replyIds.push(a.commentId);
+      const textKey = buildDuplicateTextKey(a.text);
+
+      if (a.kind === 'comment') {
+        commentIds.push(a.commentId);
+        if (textKey) commentTextKeys.push(textKey);
+      }
+      if (a.kind === 'reply') {
+        replyIds.push(a.commentId);
+        if (textKey) replyTextKeys.push(textKey);
+      }
     }
+
     this.commentIds = [...new Set(commentIds)];
     this.replyIds = [...new Set(replyIds)];
+    this.commentTextKeys = [...new Set(commentTextKeys)];
+    this.replyTextKeys = [...new Set(replyTextKeys)];
+    this.textUniquenessVersion = 1;
 
     return next();
   } catch (e) {
@@ -96,6 +121,24 @@ screenshotSchema.index(
 screenshotSchema.index(
   { linkId: 1, replyIds: 1 },
   { unique: true, partialFilterExpression: { verified: true } }
+);
+
+// prevent reusing the SAME normalized comment/reply text on the same campaign.
+// Historical records are excluded until they are rewritten with version=1;
+// controller-level legacy scanning still blocks new submissions against them.
+screenshotSchema.index(
+  { linkId: 1, commentTextKeys: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { verified: true, textUniquenessVersion: 1 }
+  }
+);
+screenshotSchema.index(
+  { linkId: 1, replyTextKeys: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { verified: true, textUniquenessVersion: 1 }
+  }
 );
 
 module.exports = mongoose.model('Screenshot', screenshotSchema);
